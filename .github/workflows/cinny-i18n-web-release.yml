@@ -1,0 +1,142 @@
+name: Build latest Cinny i18n web
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每周日 03:37 UTC 检查一次
+    # 日本时间：每周日 12:37
+    - cron: "37 3 * * 0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cinny-i18n-web-release
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: Kx501/cinny-i18n
+  UPSTREAM_REF: master
+  DEPLOY_BRANCH: web
+  DEFAULT_HOMESERVER: opensuse.org
+
+  # 如果部署到 https://用户名.github.io/仓库名/
+  # 需要先把上游 build.config.ts 里的 base 改成 /仓库名/
+  # 当前上游 build.config.ts 是 base: '/'
+  #
+  # 自定义域名或根路径部署无需改。
+  REMOVE_SOURCEMAPS: "true"
+
+jobs:
+  check-upstream:
+    name: Check latest upstream commit
+    runs-on: ubuntu-latest
+
+    outputs:
+      upstream_sha: ${{ steps.upstream.outputs.upstream_sha }}
+      upstream_short_sha: ${{ steps.upstream.outputs.upstream_short_sha }}
+      deployed_sha: ${{ steps.upstream.outputs.deployed_sha }}
+      should_build: ${{ steps.upstream.outputs.should_build }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check upstream commit
+        id: upstream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+          UPSTREAM_REF: ${{ env.UPSTREAM_REF }}
+          TARGET_REPO: ${{ github.repository }}
+          DEPLOY_BRANCH: ${{ env.DEPLOY_BRANCH }}
+          MARKER_FILE: .cinny-i18n-upstream-sha
+        run: python3 .github/scripts/check_cinny_i18n_upstream.py
+
+  build-and-publish:
+    name: Build and publish web branch
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Cinny i18n upstream
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check-upstream.outputs.upstream_sha }}
+          path: cinny-i18n
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: cinny-i18n/.node-version
+          cache: npm
+          cache-dependency-path: cinny-i18n/package-lock.json
+
+      - name: Install dependencies
+        working-directory: cinny-i18n
+        run: npm ci
+
+      - name: Build static web
+        working-directory: cinny-i18n
+        run: npm run build
+
+      - name: Patch config.json
+        working-directory: cinny-i18n
+        env:
+          DEFAULT_HOMESERVER: ${{ env.DEFAULT_HOMESERVER }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          default_homeserver = os.environ["DEFAULT_HOMESERVER"].strip()
+          config_path = Path("dist/config.json")
+
+          if not config_path.exists():
+              raise SystemExit("dist/config.json not found")
+
+          config = json.loads(config_path.read_text(encoding="utf-8"))
+
+          homeservers = config.get("homeserverList", [])
+          if not isinstance(homeservers, list):
+              homeservers = []
+
+          # Cinny 当前 config 使用 defaultHomeserver 数字索引。
+          # 这里把 opensuse.org 放到第一个，并把默认索引设为 0。
+          homeservers = [str(item) for item in homeservers if str(item) != default_homeserver]
+          config["homeserverList"] = [default_homeserver, *homeservers]
+          config["defaultHomeserver"] = 0
+
+          config_path.write_text(
+              json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          print(config_path.read_text(encoding="utf-8"))
+          PY
+
+      - name: Add deployment files
+        working-directory: cinny-i18n
+        run: |
+          printf '%s\n' '${{ needs.check-upstream.outputs.upstream_sha }}' > dist/.cinny-i18n-upstream-sha
+          printf '%s\n' '${{ needs.check-upstream.outputs.upstream_short_sha }}' > dist/.last_build_id
+          touch dist/.nojekyll
+
+          if [ "${REMOVE_SOURCEMAPS}" = "true" ]; then
+            find dist -type f -name '*.map' -delete
+          fi
+
+      - name: Publish to web branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: cinny-i18n/dist
+          publish_branch: ${{ env.DEPLOY_BRANCH }}
+          force_orphan: true
+          user_name: github-actions[bot]
+          user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_message: Deploy Cinny i18n ${{ needs.check-upstream.outputs.upstream_short_sha }} web
